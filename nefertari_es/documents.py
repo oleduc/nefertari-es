@@ -36,12 +36,17 @@ class BaseDocument(DocType):
         """ Copy meta["_id"] to IdField. """
         if self.pk_field_type() is IdField:
             pk_field = self.pk_field()
-            if not getattr(self, pk_field, None) and self._id:
-                setattr(self, pk_field, str(self._id))
+            if not getattr(self, pk_field, None) and self._id is not None:
+                self._d_[pk_field] = str(self._id)
+
+    def __setattr__(self, name, value):
+        if name == self.pk_field() and self.pk_field_type() == IdField:
+            raise AttributeError('{} is read-only'.format(self.pk_field()))
+        super(BaseDocument, self).__setattr__(name, value)
 
     def __getattr__(self, name):
         if name == '_id' and 'id' not in self.meta:
-            return
+            return None
         return super(BaseDocument, self).__getattr__(name)
 
     @classmethod
@@ -49,45 +54,71 @@ class BaseDocument(DocType):
         """ Go through relationship instances and save them, so that
         changes aren't lost, and so that fresh instances get ids
         """
+        # XXX should check to see if related objects are dirty before
+        # saving, but I don't think that es-dsl keeps track of
+        # dirty/clean
         for field in cls._relationships():
             if field not in data:
                 continue
             value = data[field]
             if not isinstance(value, (list, AttrList)):
                 value = [value]
-            return [obj.save() for obj in value if hasattr(obj, 'save')]
+            return [
+                obj.save(relationship=True)
+                for obj in value if hasattr(obj, 'save')
+                ]
+
+    def _set_backrefs(self):
+        #if not self._id:
+        #    return
+        for name in self._relationships():
+            field = self._doc_type.mapping[name]
+            backref = field._backref_field_name()
+            if not backref:
+                continue
+            if not name in self:
+                continue
+            value = self[name]
+            if not isinstance(value, (list, AttrList)):
+                value = [value]
+            for obj in value:
+                obj[backref] = self
 
     @classmethod
     def from_es(cls, hit):
-        super_call = super(BaseDocument, cls).from_es
+        inst = super(BaseDocument, cls).from_es(hit)
+        id = inst[cls.pk_field()]
+        if not id in cls._cache:
+            cls._cache[id] = inst
         if '_source' not in hit:
-            return super_call(hit)
-
-        hit = hit.copy()
+            return inst
         doc = hit['_source']
-        relationship_fields = cls._relationships()
 
+        relationship_fields = cls._relationships()
         for name in relationship_fields:
-            if name not in doc or name not in cls._nested_relationships:
+            if name not in doc:
                 continue
             field = cls._doc_type.mapping[name]
-            types = (field._doc_class, AttrDict)
+            doc_class = field._doc_class
+            types = (doc_class, AttrDict)
             data = doc[name]
 
             single_pk = not field._multi and not isinstance(data, types)
             if single_pk:
-                pk_field = field._doc_class.pk_field()
-                doc[name] = field._doc_class.get_item(**{pk_field: data})
+                pk_field = doc_class.pk_field()
+                inst[name] = doc_class.get_item(**{pk_field: data})
 
             multi_pk = field._multi and not isinstance(data[0], types)
             if multi_pk:
-                pk_field = field._doc_class.pk_field()
-                doc[name] = field._doc_class.get_collection(**{pk_field: data})
+                pk_field = doc_class.pk_field()
+                inst[name] = doc_class.get_collection(**{pk_field: data})
 
-        return super_call(hit)
+        return inst
 
-    def save(self, request=None):
-        self._save_relationships(self._d_)
+    def save(self, request=None, relationship=False):
+        self._set_backrefs()
+        if not relationship:
+            self._save_relationships(self._d_)
         super(BaseDocument, self).save()
         self._sync_id_field()
         return self
@@ -102,7 +133,22 @@ class BaseDocument(DocType):
         super(BaseDocument, self).delete()
 
     def to_dict(self, include_meta=False, _keys=None, request=None):
+        # avoid serializing backrefs (which leads to endless recursion)
+        backrefs = {}
+        for name in self._doc_type.mapping:
+            field = self._doc_type.mapping[name]
+            if isinstance(field, ReferenceField) and field._is_backref:
+                if name in self._d_:
+                    inst = self._d_[name]
+                    backrefs[name] = inst
+                    key = inst.pk_field()
+                    self._d_[name] = inst[key]
+
         data = super(BaseDocument, self).to_dict(include_meta=include_meta)
+
+        # put backrefs back
+        for name, obj in backrefs.items():
+            self._d_[name] = obj
 
         # XXX DocType and nefertari both expect a to_dict method, but
         # they expect it to act differently. DocType uses to_dict for
@@ -132,9 +178,9 @@ class BaseDocument(DocType):
                 field_obj = self._doc_type.mapping[name]
                 pk_field = field_obj._doc_class.pk_field()
                 if isinstance(inst, (list, AttrList)):
-                    loc[name] = [getattr(i, pk_field, i) for i in inst]
+                    loc[name] = [getattr(i, pk_field, None) for i in inst]
                 else:
-                    loc[name] = getattr(inst, pk_field, inst)
+                    loc[name] = getattr(inst, pk_field, None)
         return data
 
     @classmethod
@@ -181,6 +227,13 @@ class BaseDocument(DocType):
 
         :returns: Single collection item as an instance of ``cls``.
         """
+        # see if the item is cached
+        pk_field = cls.pk_field()
+        if list(kw.keys()) == [pk_field]:
+            id = kw[pk_field]
+            if id in cls._cache:
+                return cls._cache[id]
+
         result = cls.get_collection(
             _limit=1, _item_request=True,
             **kw
@@ -294,8 +347,24 @@ class BaseDocument(DocType):
             or ``sqlalchemy.exc.IntegrityError`` errors happen during DB
             query.
         """
-        # XXX should we support query_set?
-        # XXX do we need special support for _item_request
+        # see if the items are cached
+        pk_field = cls.pk_field()
+        if (list(params.keys()) == [pk_field] and _count==False
+            and _strict==True and _sort==None and _fields==None
+            and _limit==None and _page==None and _start==None
+            and _query_set==None and _item_request==False and _explain==None
+            and _search_fields==None and q==None):
+            ids = params[pk_field]
+            if not isinstance(ids, (list, tuple)):
+                ids = [ids]
+            results = []
+            for id in ids:
+                if not id in cls._cache:
+                    break
+                results.append(cls._cache[id])
+            else:
+                return results
+
         search_obj = cls.search()
 
         if _limit is not None:

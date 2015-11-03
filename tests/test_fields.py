@@ -6,9 +6,11 @@ from elasticsearch_dsl.exceptions import ValidationException
 
 from nefertari_es import fields
 from .fixtures import (
+    id_model,
     story_model,
     tag_model,
     person_model,
+    parent_model,
     )
 
 class TestFieldHelpers(object):
@@ -91,7 +93,6 @@ class TestRelationshipField(object):
         story_model._nested_relationships = ('author', 'tags')
         req = Mock()
         s = story_model(name='Moby Dick')
-        s._id = 's'
         assert s.to_dict(request=req) == {
             'name': 'Moby Dick',
             '_pk': 'Moby Dick',
@@ -108,7 +109,6 @@ class TestRelationshipField(object):
                                 person_model, tag_model):
         req = Mock()
         s = story_model(name='Moby Dick')
-        s._id = 's'
         assert s.to_dict(request=req) == {
             'name': 'Moby Dick',
             '_pk': 'Moby Dick',
@@ -131,3 +131,54 @@ class TestRelationshipField(object):
         t2 = tag_model(name='literature')
         s.tags = [t1, t2]
         assert s.to_dict()['tags'] == ['whaling', 'literature']
+
+    def test_to_dict_back_ref(self, person_model, parent_model):
+        p = parent_model(name='parent-id')
+        c = person_model(name='child-id')
+        p.children = [c]
+        p._set_backrefs()
+        assert c.to_dict() == {'name': 'child-id', 'parent': 'parent-id'}
+
+    def test_back_ref(self, person_model, parent_model):
+        p = parent_model(name='parent-id')
+        c = person_model(name='child-id')
+        p.children = [c]
+        p._set_backrefs()
+        assert p.children[0].parent is p
+
+    def test_load_back_ref(self, person_model, parent_model):
+        p = parent_model.from_es(dict(_source=dict(name='parent-id')))
+        c = person_model.from_es(dict(_source=dict(name='child-id', parent='parent-id')))
+        assert c.parent is p
+
+    def test_load_ref(self, person_model, parent_model):
+        c = person_model.from_es(dict(_source=dict(name='child-id')))
+        p = parent_model.from_es(dict(_source=dict(name='parent-id', children=['child-id'])))
+        assert p.children == [c]
+
+    def test_save_ref(self, person_model, parent_model):
+        p = parent_model(name='parent-id')
+        c = person_model(name='child-id')
+        p.children = [c]
+        p.save()
+        assert p.children[0].parent is p
+        assert c.parent.children[0] is c
+
+
+class TestIdField(object):
+
+    def test_read_only(self, id_model):
+        d = id_model()
+        with pytest.raises(AttributeError) as e:
+            d.id = 'fail'
+        assert str(e.value) == 'id is read-only'
+
+    def test_sync_id(self, id_model):
+        d = id_model()
+        assert d.id is None
+
+        # simulate a save
+        d._id = 'ID'
+        d._sync_id_field()
+
+        assert d.id == d._id
